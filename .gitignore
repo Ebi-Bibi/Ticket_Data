@@ -1,0 +1,15 @@
+# Python environments and generated files
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+
+# Local editor configuration
+.vscode/
+
+# Competition data should be downloaded separately into input/.
+input/*.csv
+data/*.csv
+
+# Generated predictions and other output artifacts
+output/*.csv
