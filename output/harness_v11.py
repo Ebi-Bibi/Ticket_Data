@@ -4,8 +4,9 @@ feature_test(): C (pair show/occupancy in D1-D3) and D (cinema behaviour from
 past episodes whose D10 is before D1). Neither beat v10.
 tuning_test(): error breakdown of v10 validation predictions, then LightGBM
 tuning with v10 features fixed. No setting beat v10.
-main(): E (cinema/city weekday pattern before D1) and F (market context of
-films released in the 6 days up to D1), v10 features and parameters.
+ef_test(): E (cinema/city weekday pattern before D1) and F (market context of
+films released in the 6 days up to D1). Neither beat v10.
+main(): G (release schedule of other films: D1 dates and movies.csv genre only).
 """
 
 import numpy as np
@@ -301,7 +302,7 @@ EF_VARIANTS = {
 }
 
 
-def main():
+def ef_test():
     train, test, history, movies, holidays, prices, _ = m5.read_inputs()
     train = m5.aggregate_daily_transactions(train)
     episodes, _ = prepare_ef(train, test, history, movies, holidays, prices)
@@ -322,6 +323,82 @@ def main():
     gain = table.loc["v10", "POOLED"] - table.loc[top, "POOLED"]
     wins = int((table.loc[top, blocks] < table.loc["v10", blocks]).sum())
     print(f"best={top} gain={gain:.4f} block_wins={wins}/3 -> {'PASS' if gain >= 0.005 and wins >= 2 else 'FAIL'}")
+
+
+FEATURES_G = [
+    f"{prefix}{name}" for prefix in ("sched_", "sched_genre_")
+    for name in ("new_to_target", "new_on_target", "new_week")
+]
+
+
+def genre_sets(movies):
+    return movies.drop_duplicates("original_title").set_index("original_title")["genre"].fillna("").map(
+        lambda g: frozenset(x.strip() for x in g.split(",") if x.strip())
+    )
+
+
+def release_schedule(train, history):
+    """D1 of every wide-release train film plus the first date of every test_history film."""
+    min_shows, frac, days = h.CHOSEN_D1_DEFINITION
+    train_d1 = h.wide_release_dates(train, min_shows, frac, days)
+    test_d1 = history.groupby("movie_title")["date_show"].min()
+    # A film in both keeps its test_history D1.
+    return pd.concat([train_d1[~train_d1.index.isin(test_d1.index)], test_d1]).rename("D1")
+
+
+def add_schedule_features(frame, schedule, genres):
+    """Counts of other films whose D1 falls after this film's D3; dates and genre only."""
+    sched_titles = schedule.index.to_numpy()
+    sched_d1 = schedule.to_numpy()
+    sched_genres = [genres.get(t, frozenset()) for t in sched_titles]
+    keys = frame[["movie_title", "history_start", "target_date"]].drop_duplicates()
+    rows = []
+    for title, d1, target in keys.itertuples(index=False):
+        own_genres = genres.get(title, frozenset())
+        other = sched_titles != title
+        same = other & np.array([bool(own_genres & g) for g in sched_genres])
+        d3 = d1 + pd.Timedelta(days=2)
+        windows = {
+            "new_to_target": (sched_d1 > d3) & (sched_d1 <= target),
+            "new_on_target": sched_d1 == target,
+            "new_week": (sched_d1 >= d1 + pd.Timedelta(days=3)) & (sched_d1 <= d1 + pd.Timedelta(days=9)),
+        }
+        row = {"movie_title": title, "history_start": d1, "target_date": target}
+        for name, window in windows.items():
+            row[f"sched_{name}"] = int((window & other).sum())
+            row[f"sched_genre_{name}"] = int((window & same).sum())
+        rows.append(row)
+    return frame.merge(pd.DataFrame(rows), on=["movie_title", "history_start", "target_date"], how="left")
+
+
+def prepare_g(train, test, history, movies, holidays, prices, with_test=False):
+    schedule, genres = release_schedule(train, history), genre_sets(movies)
+    episodes, source = hv.prepare_train(train, test, movies, holidays, prices)
+    episodes = add_schedule_features(episodes, schedule, genres)
+    if not with_test:
+        return episodes, None
+    rows = hv.prepare_test(test, history, source, movies, holidays, prices)
+    rows["history_start"] = pd.to_datetime(rows["history_start"])
+    return episodes, add_schedule_features(rows, schedule, genres)
+
+
+G_VARIANTS = {"v10": BASE, "+G": BASE + FEATURES_G}
+
+
+def main():
+    train, test, history, movies, holidays, prices, _ = m5.read_inputs()
+    train = m5.aggregate_daily_transactions(train)
+    history = m5.aggregate_daily_transactions(history)
+    episodes, test_rows = prepare_g(train, test, history, movies, holidays, prices, with_test=True)
+    hv.clean([episodes, test_rows])
+    print(f"mean sched_new_week: train={episodes['sched_new_week'].mean():.3f} test={test_rows['sched_new_week'].mean():.3f}")
+
+    table = pd.DataFrame({name: score(episodes, features) for name, features in G_VARIANTS.items()}).T
+    print(table.round(4).to_string())
+    blocks = [b[0] for b in h.VALIDATION_BLOCKS]
+    gain = table.loc["v10", "POOLED"] - table.loc["+G", "POOLED"]
+    wins = int((table.loc["+G", blocks] < table.loc["v10", blocks]).sum())
+    print(f"+G gain={gain:.4f} block_wins={wins}/3 -> {'PASS' if gain >= 0.005 and wins >= 2 else 'FAIL'}")
 
 
 if __name__ == "__main__":
